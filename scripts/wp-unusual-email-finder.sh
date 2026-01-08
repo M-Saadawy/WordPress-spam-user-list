@@ -1,7 +1,12 @@
 #!/bin/bash
 # =====================================
-# WP User & Comment Cleanup Script (FIXED)
-# CRITICAL FIX: Uses exact domain matching to prevent false positives
+# WP Unusual Email Finder Script (Script 3)
+# Purpose: Find users with uncommon email providers
+# Features: 
+# - Uses GitHub whitelist as "common providers"
+# - Lists all unusual email domains
+# - Export to CSV, TXT, and JSON
+# - Statistics and analysis
 # =====================================
 
 # Color definitions
@@ -22,243 +27,97 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 # Create log directory if it doesn't exist
 mkdir -p "$LOG_DIR"
 
-# Use fixed filenames (no timestamp) - will append to same files
-DOMAINS_LOG="$LOG_DIR/spam_domains.txt"
-DOMAINS_CSV="$LOG_DIR/spam_domains.csv"
-DOMAINS_JSON="$LOG_DIR/spam_domains.json"
-COMMENTS_LOG="$LOG_DIR/deleted_comments_$TIMESTAMP.txt"
+# Output files
+UNUSUAL_EMAILS_TXT="$LOG_DIR/unusual_emails_$TIMESTAMP.txt"
+UNUSUAL_EMAILS_CSV="$LOG_DIR/unusual_emails_$TIMESTAMP.csv"
+UNUSUAL_EMAILS_JSON="$LOG_DIR/unusual_emails_$TIMESTAMP.json"
+DOMAIN_STATS_TXT="$LOG_DIR/domain_statistics_$TIMESTAMP.txt"
 
-# Initialize domain tracking
-declare -A DOMAIN_MAP
-
-# WHITELIST - Legitimate domains that should NEVER be deleted
-WHITELIST_DOMAINS=(
-    "gmail.com"
-    "yahoo.com"
-    "outlook.com"
-    "hotmail.com"
-    "icloud.com"
-    "protonmail.com"
-    "aol.com"
-    "zoho.com"
-    "mail.com"
-    "yandex.com"
-    "live.com"
-    "msn.com"
-)
+# Arrays for tracking
+declare -A DOMAIN_COUNT
+declare -A DOMAIN_USERS
+declare -A COMMON_PROVIDERS
 
 echo -e "${CYAN}=============================================${NC}"
-echo -e "${CYAN}==== WordPress User & Comment Cleanup ====${NC}"
-echo -e "${CYAN}==== (FIXED - Exact Domain Matching) ====${NC}"
+echo -e "${CYAN}==== WordPress Unusual Email Finder =======
+${NC}"
+echo -e "${CYAN}==== Find Uncommon Email Providers ========${NC}"
 echo -e "${CYAN}=============================================${NC}"
 echo
 
-# Function to check if domain is whitelisted
-is_whitelisted() {
+# =====================================
+# FETCH COMMON PROVIDERS (WHITELIST) FROM GITHUB
+# =====================================
+echo -e "${BLUE}Fetching list of common email providers from GitHub...${NC}"
+WHITELIST_URL="https://raw.githubusercontent.com/M-Saadawy/WordPress-spam-user-list/main/whitelist.txt"
+TEMP_WHITELIST=$(mktemp)
+
+COMMON_PROVIDER_LIST=()
+
+if curl -s -f "$WHITELIST_URL" -o "$TEMP_WHITELIST" 2>/dev/null && [ -s "$TEMP_WHITELIST" ]; then
+    echo -e "${GREEN}✓ Successfully downloaded common providers list from GitHub${NC}"
+    
+    # Load common providers from file
+    while IFS= read -r line; do
+        # Trim whitespace
+        line=$(echo "$line" | xargs)
+        # Skip empty lines and comments
+        if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
+            # Remove @ if present
+            line="${line#@}"
+            COMMON_PROVIDER_LIST+=("$line")
+            COMMON_PROVIDERS["$line"]=1
+        fi
+    done < "$TEMP_WHITELIST"
+    
+    echo -e "${GREEN}  Loaded ${#COMMON_PROVIDER_LIST[@]} common email providers${NC}"
+    if [ ${#COMMON_PROVIDER_LIST[@]} -gt 3 ]; then
+        echo -e "${GRAY}  Sample: ${COMMON_PROVIDER_LIST[0]}, ${COMMON_PROVIDER_LIST[1]}, ${COMMON_PROVIDER_LIST[2]}...${NC}"
+    fi
+else
+    echo -e "${RED}✗ ERROR: Could not fetch common providers list from GitHub${NC}"
+    echo -e "${RED}  URL: $WHITELIST_URL${NC}"
+    echo -e "${RED}  This list is required for operation. Exiting.${NC}"
+    rm -f "$TEMP_WHITELIST"
+    exit 1
+fi
+rm -f "$TEMP_WHITELIST"
+
+# Verify we have providers loaded
+if [ ${#COMMON_PROVIDER_LIST[@]} -eq 0 ]; then
+    echo -e "${RED}✗ ERROR: Common providers list is empty. Cannot proceed. Exiting.${NC}"
+    exit 1
+fi
+
+# Function to check if domain is a common provider
+is_common_provider() {
     local domain="$1"
     # Remove @ if present
     domain="${domain#@}"
     
-    for whitelist in "${WHITELIST_DOMAINS[@]}"; do
-        if [[ "$domain" == "$whitelist" ]]; then
-            return 0  # Is whitelisted
-        fi
-    done
-    return 1  # Not whitelisted
+    if [[ -n "${COMMON_PROVIDERS[$domain]}" ]]; then
+        return 0  # Is common provider
+    fi
+    return 1  # Not common provider (unusual)
 }
 
 # =====================================
-# STEP 1: CLEANUP MODE SELECTION
+# SCAN ALL WORDPRESS SITES
 # =====================================
-echo -e "${YELLOW}What would you like to clean up?${NC}"
-echo -e "${WHITE}  1) Users only (based on spam domains)${NC}"
-echo -e "${WHITE}  2) Comments only (based on keywords)${NC}"
-echo -e "${WHITE}  3) Both users and comments${NC}"
-read -p "$(echo -e ${YELLOW}Enter choice 1, 2, or 3: ${NC})" CLEANUP_MODE
-
-if [[ ! "$CLEANUP_MODE" =~ ^[1-3]$ ]]; then
-    echo -e "${RED}Invalid choice. Exiting.${NC}"
-    exit 1
-fi
-
-# =====================================
-# STEP 2: USER CLEANUP CONFIGURATION
-# =====================================
-SPAM_DOMAINS=()
-if [[ "$CLEANUP_MODE" == "1" || "$CLEANUP_MODE" == "3" ]]; then
-    echo
-    echo -e "${YELLOW}Choose input method for user cleanup:${NC}"
-    echo -e "${WHITE}  1) Fetch spam domains from GitHub (recommended)${NC}"
-    echo -e "${WHITE}  2) Enter domain manually${NC}"
-    read -p "$(echo -e ${YELLOW}Enter choice 1 or 2: ${NC})" CHOICE
-
-    if [ "$CHOICE" == "1" ]; then
-        echo -e "${BLUE}Fetching spam domain list from GitHub...${NC}"
-        GITHUB_URL="https://raw.githubusercontent.com/M-Saadawy/WordPress-spam-user-list/main/list.txt"
-        
-        # Download the list
-        TEMP_FILE=$(mktemp)
-        if curl -s -f "$GITHUB_URL" -o "$TEMP_FILE"; then
-            SKIPPED_COUNT=0
-            # Read domains into array, skipping empty lines and comments
-            while IFS= read -r line; do
-                # Trim whitespace
-                line=$(echo "$line" | xargs)
-                # Skip empty lines and comments
-                if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
-                    # Add @ if not present
-                    if [[ ! "$line" =~ ^@ ]]; then
-                        line="@$line"
-                    fi
-                    
-                    # Check if domain is whitelisted
-                    if is_whitelisted "$line"; then
-                        echo -e "${YELLOW}⚠ Skipping whitelisted domain: $line${NC}"
-                        ((SKIPPED_COUNT++))
-                    else
-                        SPAM_DOMAINS+=("$line")
-                    fi
-                fi
-            done < "$TEMP_FILE"
-            rm -f "$TEMP_FILE"
-            
-            echo -e "${GREEN}Successfully loaded ${#SPAM_DOMAINS[@]} spam domains from GitHub${NC}"
-            if [ $SKIPPED_COUNT -gt 0 ]; then
-                echo -e "${YELLOW}Skipped $SKIPPED_COUNT whitelisted domains for safety${NC}"
-            fi
-        else
-            echo -e "${RED}Failed to download spam list from GitHub.${NC}"
-            echo -e "${YELLOW}Falling back to manual entry...${NC}"
-            read -p "$(echo -e ${YELLOW}Enter the email/domain to search for e.g., @orbitaloffer.online: ${NC})" VALUE
-            if [ -z "$VALUE" ]; then
-                echo -e "${RED}No value entered. Exiting.${NC}"
-                exit 1
-            fi
-            
-            # Check if manually entered domain is whitelisted
-            if is_whitelisted "$VALUE"; then
-                echo -e "${RED}ERROR: '$VALUE' is a whitelisted domain and cannot be used.${NC}"
-                echo -e "${YELLOW}Whitelisted domains: ${WHITELIST_DOMAINS[*]}${NC}"
-                exit 1
-            fi
-            
-            SPAM_DOMAINS=("$VALUE")
-        fi
-    elif [ "$CHOICE" == "2" ]; then
-        read -p "$(echo -e ${YELLOW}Enter the email/domain to search for e.g., @orbitaloffer.online: ${NC})" VALUE
-        if [ -z "$VALUE" ]; then
-            echo -e "${RED}No value entered. Exiting.${NC}"
-            exit 1
-        fi
-        
-        # Check if manually entered domain is whitelisted
-        if is_whitelisted "$VALUE"; then
-            echo -e "${RED}ERROR: '$VALUE' is a whitelisted domain and cannot be used.${NC}"
-            echo -e "${YELLOW}Whitelisted domains: ${WHITELIST_DOMAINS[*]}${NC}"
-            exit 1
-        fi
-        
-        SPAM_DOMAINS=("$VALUE")
-    else
-        echo -e "${RED}Invalid choice. Exiting.${NC}"
-        exit 1
-    fi
-    
-    # Show preview before proceeding
-    if [ ${#SPAM_DOMAINS[@]} -gt 0 ]; then
-        echo
-        echo -e "${YELLOW}The following ${#SPAM_DOMAINS[@]} domains will be searched for deletion:${NC}"
-        for domain in "${SPAM_DOMAINS[@]}"; do
-            echo -e "${CYAN}  - $domain${NC}"
-        done
-        echo
-        read -p "$(echo -e ${YELLOW}Do you want to proceed with these domains? Type 'yes' to continue: ${NC})" PROCEED
-        if [ "$PROCEED" != "yes" ]; then
-            echo -e "${RED}Aborted by user.${NC}"
-            exit 1
-        fi
-    fi
-fi
-
-# =====================================
-# STEP 3: COMMENT CLEANUP CONFIGURATION
-# =====================================
-SPAM_KEYWORDS=()
-if [[ "$CLEANUP_MODE" == "2" || "$CLEANUP_MODE" == "3" ]]; then
-    echo
-    echo -e "${YELLOW}Configure comment keyword search:${NC}"
-    echo -e "${WHITE}  1) Fetch spam keywords from GitHub (recommended)${NC}"
-    echo -e "${WHITE}  2) Enter custom keywords${NC}"
-    read -p "$(echo -e ${YELLOW}Enter choice 1 or 2: ${NC})" KEYWORD_CHOICE
-
-    if [ "$KEYWORD_CHOICE" == "1" ]; then
-        echo -e "${BLUE}Fetching spam keyword list from GitHub...${NC}"
-        GITHUB_KEYWORDS_URL="https://raw.githubusercontent.com/M-Saadawy/WordPress-spam-user-list/main/comments.txt"
-        
-        # Download the keywords list
-        TEMP_KEYWORDS_FILE=$(mktemp)
-        if curl -s -f "$GITHUB_KEYWORDS_URL" -o "$TEMP_KEYWORDS_FILE"; then
-            # Read keywords into array, skipping empty lines and comments
-            while IFS= read -r line; do
-                # Trim whitespace
-                line=$(echo "$line" | xargs)
-                # Skip empty lines and comments
-                if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
-                    SPAM_KEYWORDS+=("$line")
-                fi
-            done < "$TEMP_KEYWORDS_FILE"
-            rm -f "$TEMP_KEYWORDS_FILE"
-            
-            if [ ${#SPAM_KEYWORDS[@]} -gt 0 ]; then
-                echo -e "${GREEN}Successfully loaded ${#SPAM_KEYWORDS[@]} spam keywords from GitHub${NC}"
-                echo -e "${GRAY}Sample keywords: ${SPAM_KEYWORDS[0]}, ${SPAM_KEYWORDS[1]}, ${SPAM_KEYWORDS[2]}...${NC}"
-            else
-                echo -e "${YELLOW}Warning: No keywords loaded from GitHub. Using fallback keywords.${NC}"
-                SPAM_KEYWORDS=("BINANCE" "BTC" "CRYPTO" "BITCOIN" "ETHEREUM" "USDT" "WALLET")
-                echo -e "${GREEN}Using fallback keywords: ${SPAM_KEYWORDS[*]}${NC}"
-            fi
-        else
-            echo -e "${RED}Failed to download spam keyword list from GitHub.${NC}"
-            echo -e "${YELLOW}Using fallback keywords...${NC}"
-            SPAM_KEYWORDS=("BINANCE" "BTC" "CRYPTO" "BITCOIN" "ETHEREUM" "USDT" "WALLET")
-            echo -e "${GREEN}Using fallback keywords: ${SPAM_KEYWORDS[*]}${NC}"
-        fi
-    elif [ "$KEYWORD_CHOICE" == "2" ]; then
-        echo -e "${YELLOW}Enter keywords separated by commas (e.g., BINANCE,CRYPTO,BITCOIN):${NC}"
-        read -p "Keywords: " KEYWORD_INPUT
-        if [ -z "$KEYWORD_INPUT" ]; then
-            echo -e "${RED}No keywords entered. Exiting.${NC}"
-            exit 1
-        fi
-        IFS=',' read -ra SPAM_KEYWORDS <<< "$KEYWORD_INPUT"
-        # Trim whitespace from each keyword
-        for i in "${!SPAM_KEYWORDS[@]}"; do
-            SPAM_KEYWORDS[$i]=$(echo "${SPAM_KEYWORDS[$i]}" | xargs)
-        done
-        echo -e "${GREEN}Using custom keywords: ${SPAM_KEYWORDS[*]}${NC}"
-    else
-        echo -e "${RED}Invalid choice. Exiting.${NC}"
-        exit 1
-    fi
-fi
-
-# Escape special characters for SQL
-escape_for_sql() {
-    echo "$1" | sed "s/'/''/g"
-}
-
 echo
-echo -e "${BLUE}Searching all WordPress sites under $BASE_DIR ...${NC}"
-echo -e "${GRAY}Log files will be saved to: $LOG_DIR${NC}"
+echo -e "${BLUE}Scanning all WordPress sites under $BASE_DIR ...${NC}"
+echo -e "${GRAY}This may take a moment...${NC}"
 echo
 
-TOTAL_DELETED_USERS=0
-TOTAL_DELETED_COMMENTS=0
+TOTAL_USERS=0
+TOTAL_UNUSUAL_USERS=0
+TOTAL_COMMON_USERS=0
+TOTAL_SITES=0
 
 for SITE_PATH in $BASE_DIR/*/public_html; do
     if [ -f "$SITE_PATH/wp-config.php" ]; then
-        echo -e "${MAGENTA}-------------------------------------------${NC}"
-        echo -e "${WHITE}Site detected: ${CYAN}$SITE_PATH${NC}"
+        SITE_NAME=$(basename $(dirname $(dirname "$SITE_PATH")))
+        echo -e "${MAGENTA}Scanning: ${CYAN}$SITE_NAME${NC}"
 
         # Extract database credentials from wp-config.php
         DB_NAME=$(grep "DB_NAME" "$SITE_PATH/wp-config.php" | cut -d"'" -f4)
@@ -269,317 +128,241 @@ for SITE_PATH in $BASE_DIR/*/public_html; do
 
         if [ -z "$PREFIX" ]; then
             PREFIX="wp_"
-            echo -e "${YELLOW}Warning: Could not detect prefix, using default: $PREFIX${NC}"
         fi
 
         if [ -z "$DB_NAME" ] || [ -z "$DB_USER" ]; then
-            echo -e "${RED}Error: Could not extract database credentials from wp-config.php${NC}"
+            echo -e "${RED}  Error: Could not extract database credentials${NC}"
             continue
         fi
 
-        echo -e "${GRAY}  Database: $DB_NAME, Prefix: $PREFIX${NC}"
+        # Get all users with their emails
+        USER_DATA=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "
+        SELECT ID, user_login, user_email, user_registered 
+        FROM ${PREFIX}users
+        ORDER BY user_registered DESC;
+        " 2>/dev/null)
 
-        # =====================================
-        # USER CLEANUP - WITH EXACT DOMAIN MATCHING
-        # =====================================
-        if [[ "$CLEANUP_MODE" == "1" || "$CLEANUP_MODE" == "3" ]]; then
-            echo -e "${GRAY}  Searching for ${#SPAM_DOMAINS[@]} spam domain(s)...${NC}"
-
-            # CRITICAL FIX: Use SUBSTRING_INDEX to extract exact domain after @
-            # This prevents @gmail.com.ph from matching @gmail.com
-            
-            WHERE_CLAUSE=""
-            
-            # Build WHERE clause with exact domain matching
-            for domain in "${SPAM_DOMAINS[@]}"; do
-                domain_escaped=$(escape_for_sql "$domain")
-                # Remove @ from domain for matching
-                domain_no_at="${domain_escaped#@}"
-                
-                if [ -z "$WHERE_CLAUSE" ]; then
-                    # EXACT match: SUBSTRING_INDEX(user_email, '@', -1) gets everything after @
-                    WHERE_CLAUSE="SUBSTRING_INDEX(user_email, '@', -1) = '$domain_no_at'"
-                else
-                    WHERE_CLAUSE="$WHERE_CLAUSE OR SUBSTRING_INDEX(user_email, '@', -1) = '$domain_no_at'"
-                fi
-            done
-            
-            # Also search in username/login for spam keywords (optional)
-            SPAM_USER_KEYWORDS=("BINANCE" "BYBIT" "BTC" "BITCOIN" "CRYPTO" "MINING" "WALLET" "ETHEREUM" "USDT")
-            for keyword in "${SPAM_USER_KEYWORDS[@]}"; do
-                keyword_escaped=$(escape_for_sql "$keyword")
-                WHERE_CLAUSE="$WHERE_CLAUSE OR user_login LIKE '%$keyword_escaped%'"
-            done
-
-            # Get matching users details BEFORE deletion
-            USER_DATA=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "
-            SELECT ID, user_login, user_email 
-            FROM ${PREFIX}users
-            WHERE $WHERE_CLAUSE;
-            " 2>/dev/null)
-
-            # Count matching users
-            if [ -z "$USER_DATA" ]; then
-                USER_COUNT=0
-            else
-                USER_COUNT=$(echo "$USER_DATA" | wc -l)
-            fi
-
-            if [ "$USER_COUNT" -gt 0 ]; then
-                echo -e "${GREEN}Found $USER_COUNT user(s) with spam domains:${NC}"
-                echo "$USER_DATA" | while IFS=$'\t' read -r USER_ID USER_LOGIN USER_EMAIL; do
-                    # Extract and store domain
-                    DOMAIN=$(echo "$USER_EMAIL" | grep -oP '@\K.*')
-                    DOMAIN_MAP["$DOMAIN"]=1
-                    echo -e "${YELLOW}  - ID: $USER_ID, Login: $USER_LOGIN, Email: $USER_EMAIL${NC}"
-                done
-                
-                read -p "$(echo -e ${RED}Do you want to DELETE these users? Type 'yes' to confirm: ${NC})" CONFIRM
-                
-                if [ "$CONFIRM" == "yes" ]; then
-                    # Get user IDs for comment deletion
-                    USER_IDS=$(echo "$USER_DATA" | cut -f1 | tr '\n' ',' | sed 's/,$//')
-                    
-                    # Count comments by these users
-                    COMMENT_COUNT_BY_USERS=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "
-                    SELECT COUNT(*) FROM ${PREFIX}comments WHERE user_id IN ($USER_IDS);
-                    " 2>/dev/null)
-                    
-                    # Default to 0 if query returns empty/null
-                    COMMENT_COUNT_BY_USERS=${COMMENT_COUNT_BY_USERS:-0}
-                    
-                    if [ "$COMMENT_COUNT_BY_USERS" -gt 0 ]; then
-                        echo -e "${YELLOW}  → These users have $COMMENT_COUNT_BY_USERS comment(s) that will also be deleted${NC}"
-                    fi
-                    
-                    # Perform deletion - delete comments first, then commentmeta, then usermeta, then users
-                    
-                    # Delete commentmeta for comments by these users
-                    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-                    DELETE FROM ${PREFIX}commentmeta
-                    WHERE comment_id IN (
-                        SELECT comment_ID FROM (SELECT comment_ID FROM ${PREFIX}comments WHERE user_id IN ($USER_IDS)) AS temp
-                    );
-                    " 2>/dev/null
-                    
-                    # Delete comments by these users
-                    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-                    DELETE FROM ${PREFIX}comments WHERE user_id IN ($USER_IDS);
-                    " 2>/dev/null
-                    
-                    # Delete usermeta
-                    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-                    DELETE FROM ${PREFIX}usermeta
-                    WHERE user_id IN (
-                        SELECT ID FROM (SELECT ID FROM ${PREFIX}users WHERE $WHERE_CLAUSE) AS temp
-                    );
-                    " 2>/dev/null
-
-                    # Delete users
-                    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-                    DELETE FROM ${PREFIX}users
-                    WHERE $WHERE_CLAUSE;
-                    " 2>/dev/null
-                    
-                    echo -e "${GREEN}✓ Deleted $USER_COUNT user(s)${NC}"
-                    if [ "$COMMENT_COUNT_BY_USERS" -gt 0 ]; then
-                        echo -e "${GREEN}✓ Deleted $COMMENT_COUNT_BY_USERS comment(s) by those users${NC}"
-                        TOTAL_DELETED_COMMENTS=$((TOTAL_DELETED_COMMENTS + COMMENT_COUNT_BY_USERS))
-                    fi
-                    TOTAL_DELETED_USERS=$((TOTAL_DELETED_USERS + USER_COUNT))
-                else
-                    echo -e "${GRAY}Skipped user deletion${NC}"
-                fi
-            else
-                echo -e "${GRAY}No spam users found${NC}"
-            fi
+        if [ -z "$USER_DATA" ]; then
+            echo -e "${GRAY}  No users found${NC}"
+            continue
         fi
 
-        # =====================================
-        # COMMENT CLEANUP
-        # =====================================
-        if [[ "$CLEANUP_MODE" == "2" || "$CLEANUP_MODE" == "3" ]]; then
-            echo
-            echo -e "${GRAY}  Searching for comments with spam keywords...${NC}"
-
-            # Build SQL WHERE clause for keywords (search in multiple fields)
-            declare -A UNIQUE_WORDS
-            for keyword in "${SPAM_KEYWORDS[@]}"; do
-                # Split phrase into individual words
-                IFS=' ' read -ra WORDS <<< "$keyword"
-                for word in "${WORDS[@]}"; do
-                    # Only add words that are 3+ characters
-                    if [ ${#word} -ge 3 ]; then
-                        UNIQUE_WORDS["$word"]=1
+        SITE_USERS=0
+        SITE_UNUSUAL=0
+        
+        while IFS=$'\t' read -r USER_ID USER_LOGIN USER_EMAIL USER_REGISTERED; do
+            TOTAL_USERS=$((TOTAL_USERS + 1))
+            SITE_USERS=$((SITE_USERS + 1))
+            
+            # Extract domain from email
+            DOMAIN=$(echo "$USER_EMAIL" | grep -oP '@\K.*')
+            
+            if [ -n "$DOMAIN" ]; then
+                # Check if it's a common provider
+                if ! is_common_provider "$DOMAIN"; then
+                    # Unusual email found
+                    TOTAL_UNUSUAL_USERS=$((TOTAL_UNUSUAL_USERS + 1))
+                    SITE_UNUSUAL=$((SITE_UNUSUAL + 1))
+                    
+                    # Track domain count
+                    if [[ -n "${DOMAIN_COUNT[$DOMAIN]}" ]]; then
+                        DOMAIN_COUNT[$DOMAIN]=$((${DOMAIN_COUNT[$DOMAIN]} + 1))
+                    else
+                        DOMAIN_COUNT[$DOMAIN]=1
                     fi
-                done
-            done
-            
-            COMMENT_WHERE=""
-            for word in "${!UNIQUE_WORDS[@]}"; do
-                word_escaped=$(escape_for_sql "$word")
-                if [ -z "$COMMENT_WHERE" ]; then
-                    COMMENT_WHERE="(comment_content LIKE '%$word_escaped%' OR comment_author LIKE '%$word_escaped%' OR comment_author_email LIKE '%$word_escaped%' OR comment_author_url LIKE '%$word_escaped%')"
-                else
-                    COMMENT_WHERE="$COMMENT_WHERE OR (comment_content LIKE '%$word_escaped%' OR comment_author LIKE '%$word_escaped%' OR comment_author_email LIKE '%$word_escaped%' OR comment_author_url LIKE '%$word_escaped%')"
-                fi
-            done
-            
-            echo -e "${GRAY}  Searching for ${#UNIQUE_WORDS[@]} unique spam keywords...${NC}"
-
-            # Get matching comments BEFORE deletion
-            COMMENT_DATA=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "
-            SELECT comment_ID, comment_author, comment_author_email, LEFT(comment_content, 100)
-            FROM ${PREFIX}comments
-            WHERE $COMMENT_WHERE;
-            " 2>/dev/null)
-
-            # Count matching comments
-            if [ -z "$COMMENT_DATA" ]; then
-                COMMENT_COUNT=0
-            else
-                COMMENT_COUNT=$(echo "$COMMENT_DATA" | wc -l)
-            fi
-
-            if [ "$COMMENT_COUNT" -gt 0 ]; then
-                echo -e "${GREEN}Found $COMMENT_COUNT spam comment(s):${NC}"
-                
-                # Save to log file
-                echo "=== Spam Comments Found in $SITE_PATH ===" >> "$COMMENTS_LOG"
-                echo "Timestamp: $(date)" >> "$COMMENTS_LOG"
-                echo "Database: $DB_NAME" >> "$COMMENTS_LOG"
-                echo "" >> "$COMMENTS_LOG"
-                
-                echo "$COMMENT_DATA" | while IFS=$'\t' read -r COMMENT_ID AUTHOR EMAIL CONTENT; do
-                    echo -e "${YELLOW}  - ID: $COMMENT_ID${NC}"
-                    echo -e "${GRAY}    Author: $AUTHOR${NC}"
-                    echo -e "${GRAY}    Email: $EMAIL${NC}"
-                    echo -e "${GRAY}    Content: ${CONTENT:0:80}...${NC}"
                     
-                    # Log to file
-                    echo "Comment ID: $COMMENT_ID" >> "$COMMENTS_LOG"
-                    echo "  Author: $AUTHOR" >> "$COMMENTS_LOG"
-                    echo "  Email: $EMAIL" >> "$COMMENTS_LOG"
-                    echo "  Content: $CONTENT" >> "$COMMENTS_LOG"
-                    echo "" >> "$COMMENTS_LOG"
-                done
-                
-                read -p "$(echo -e ${RED}Do you want to DELETE these comments? Type 'yes' to confirm: ${NC})" CONFIRM_COMMENTS
-                
-                if [ "$CONFIRM_COMMENTS" == "yes" ]; then
-                    # Delete comment meta first, then comments
-                    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-                    DELETE FROM ${PREFIX}commentmeta
-                    WHERE comment_id IN (
-                        SELECT comment_ID FROM (SELECT comment_ID FROM ${PREFIX}comments WHERE $COMMENT_WHERE) AS temp
-                    );
-                    " 2>/dev/null
-
-                    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-                    DELETE FROM ${PREFIX}comments
-                    WHERE $COMMENT_WHERE;
-                    " 2>/dev/null
-                    
-                    echo -e "${GREEN}✓ Deleted $COMMENT_COUNT comment(s)${NC}"
-                    TOTAL_DELETED_COMMENTS=$((TOTAL_DELETED_COMMENTS + COMMENT_COUNT))
+                    # Store user details for this domain
+                    USER_DETAILS="$SITE_NAME|$USER_ID|$USER_LOGIN|$USER_EMAIL|$USER_REGISTERED"
+                    if [[ -n "${DOMAIN_USERS[$DOMAIN]}" ]]; then
+                        DOMAIN_USERS[$DOMAIN]="${DOMAIN_USERS[$DOMAIN]}::$USER_DETAILS"
+                    else
+                        DOMAIN_USERS[$DOMAIN]="$USER_DETAILS"
+                    fi
                 else
-                    echo -e "${GRAY}Skipped comment deletion${NC}"
+                    TOTAL_COMMON_USERS=$((TOTAL_COMMON_USERS + 1))
                 fi
-            else
-                echo -e "${GRAY}No spam comments found${NC}"
             fi
-        fi
-        echo
+        done <<< "$USER_DATA"
+        
+        echo -e "${GRAY}  Users: $SITE_USERS | Unusual: $SITE_UNUSUAL${NC}"
+        TOTAL_SITES=$((TOTAL_SITES + 1))
     fi
 done
 
-# Write unique spam domains to log files
-if [[ "$CLEANUP_MODE" == "1" || "$CLEANUP_MODE" == "3" ]] && [ ${#DOMAIN_MAP[@]} -gt 0 ]; then
-    # Read existing domains from files to avoid duplicates
-    declare -A EXISTING_DOMAINS
-    
-    if [ -f "$DOMAINS_LOG" ]; then
-        while IFS= read -r line; do
-            if [[ ! "$line" =~ ^# ]] && [ -n "$line" ]; then
-                EXISTING_DOMAINS["$line"]=1
-            fi
-        done < "$DOMAINS_LOG"
-    fi
-    
-    # Merge new domains with existing
-    for domain in "${!DOMAIN_MAP[@]}"; do
-        EXISTING_DOMAINS["$domain"]=1
-    done
-    
-    # TXT format
-    echo "# Spam Domains Log" > "$DOMAINS_LOG"
-    echo "# Last updated: $(date)" >> "$DOMAINS_LOG"
-    echo "# Total unique domains: ${#EXISTING_DOMAINS[@]}" >> "$DOMAINS_LOG"
-    echo "# ================================" >> "$DOMAINS_LOG"
-    for domain in "${!EXISTING_DOMAINS[@]}"; do
-        echo "$domain"
-    done | sort >> "$DOMAINS_LOG"
-
-    # CSV format
-    echo "domain" > "$DOMAINS_CSV"
-    for domain in "${!EXISTING_DOMAINS[@]}"; do
-        echo "$domain"
-    done | sort >> "$DOMAINS_CSV"
-
-    # JSON format
-    echo "{" > "$DOMAINS_JSON"
-    echo "  \"last_updated\": \"$(date -Iseconds)\"," >> "$DOMAINS_JSON"
-    echo "  \"total_domains\": ${#EXISTING_DOMAINS[@]}," >> "$DOMAINS_JSON"
-    echo "  \"domains\": [" >> "$DOMAINS_JSON"
-    
-    FIRST=true
-    for domain in $(for d in "${!EXISTING_DOMAINS[@]}"; do echo "$d"; done | sort); do
-        if [ "$FIRST" = true ]; then
-            FIRST=false
-        else
-            echo "," >> "$DOMAINS_JSON"
-        fi
-        echo -n "    \"$domain\"" >> "$DOMAINS_JSON"
-    done
-    
-    echo "" >> "$DOMAINS_JSON"
-    echo "  ]" >> "$DOMAINS_JSON"
-    echo "}" >> "$DOMAINS_JSON"
-fi
-
 # =====================================
-# FINAL SUMMARY
+# GENERATE REPORTS
 # =====================================
+echo
 echo -e "${CYAN}=============================================${NC}"
-echo -e "${CYAN}==== Cleanup script finished =============${NC}"
+echo -e "${CYAN}==== Generating Reports ====================${NC}"
 echo -e "${CYAN}=============================================${NC}"
 echo
 
-if [ "$TOTAL_DELETED_USERS" -gt 0 ] || [ "$TOTAL_DELETED_COMMENTS" -gt 0 ]; then
-    echo -e "${GREEN}Summary:${NC}"
-    if [ "$TOTAL_DELETED_USERS" -gt 0 ]; then
-        echo -e "${GREEN}  Total users deleted: $TOTAL_DELETED_USERS${NC}"
-        echo -e "${GREEN}  Unique spam domains: ${#DOMAIN_MAP[@]}${NC}"
-    fi
-    if [ "$TOTAL_DELETED_COMMENTS" -gt 0 ]; then
-        echo -e "${GREEN}  Total comments deleted: $TOTAL_DELETED_COMMENTS${NC}"
-    fi
-    echo
-    
-    if [[ "$CLEANUP_MODE" == "1" || "$CLEANUP_MODE" == "3" ]]; then
-        echo -e "${YELLOW}Spam domain logs saved to:${NC}"
-        echo -e "${CYAN}  TXT:  $DOMAINS_LOG${NC}"
-        echo -e "${CYAN}  CSV:  $DOMAINS_CSV${NC}"
-        echo -e "${CYAN}  JSON: $DOMAINS_JSON${NC}"
-        echo
-    fi
-    
-    if [[ "$CLEANUP_MODE" == "2" || "$CLEANUP_MODE" == "3" ]]; then
-        echo -e "${YELLOW}Deleted comments log saved to:${NC}"
-        echo -e "${CYAN}  $COMMENTS_LOG${NC}"
-        echo
-    fi
-else
-    echo -e "${YELLOW}Summary:${NC}"
-    echo -e "${YELLOW}  No items were deleted${NC}"
+if [ ${#DOMAIN_COUNT[@]} -eq 0 ]; then
+    echo -e "${GREEN}Great news! No unusual email domains found.${NC}"
+    echo -e "${GRAY}All users are using common email providers.${NC}"
+    exit 0
 fi
+
+# =====================================
+# TXT REPORT
+# =====================================
+echo "WordPress Unusual Email Domains Report" > "$UNUSUAL_EMAILS_TXT"
+echo "======================================" >> "$UNUSUAL_EMAILS_TXT"
+echo "Generated: $(date)" >> "$UNUSUAL_EMAILS_TXT"
+echo "Total Sites Scanned: $TOTAL_SITES" >> "$UNUSUAL_EMAILS_TXT"
+echo "Total Users: $TOTAL_USERS" >> "$UNUSUAL_EMAILS_TXT"
+echo "Common Provider Users: $TOTAL_COMMON_USERS" >> "$UNUSUAL_EMAILS_TXT"
+echo "Unusual Provider Users: $TOTAL_UNUSUAL_USERS" >> "$UNUSUAL_EMAILS_TXT"
+echo "Unique Unusual Domains: ${#DOMAIN_COUNT[@]}" >> "$UNUSUAL_EMAILS_TXT"
+echo "" >> "$UNUSUAL_EMAILS_TXT"
+echo "======================================" >> "$UNUSUAL_EMAILS_TXT"
+echo "" >> "$UNUSUAL_EMAILS_TXT"
+
+# Sort domains by count (most common first)
+for domain in $(for d in "${!DOMAIN_COUNT[@]}"; do echo "${DOMAIN_COUNT[$d]} $d"; done | sort -rn | cut -d' ' -f2); do
+    COUNT=${DOMAIN_COUNT[$domain]}
+    echo "Domain: $domain ($COUNT user(s))" >> "$UNUSUAL_EMAILS_TXT"
+    echo "----------------------------------------" >> "$UNUSUAL_EMAILS_TXT"
+    
+    # Get all users for this domain
+    IFS='::' read -ra USERS <<< "${DOMAIN_USERS[$domain]}"
+    for user_info in "${USERS[@]}"; do
+        IFS='|' read -r SITE USER_ID USER_LOGIN USER_EMAIL USER_REGISTERED <<< "$user_info"
+        echo "  Site: $SITE" >> "$UNUSUAL_EMAILS_TXT"
+        echo "  User ID: $USER_ID" >> "$UNUSUAL_EMAILS_TXT"
+        echo "  Login: $USER_LOGIN" >> "$UNUSUAL_EMAILS_TXT"
+        echo "  Email: $USER_EMAIL" >> "$UNUSUAL_EMAILS_TXT"
+        echo "  Registered: $USER_REGISTERED" >> "$UNUSUAL_EMAILS_TXT"
+        echo "" >> "$UNUSUAL_EMAILS_TXT"
+    done
+    echo "" >> "$UNUSUAL_EMAILS_TXT"
+done
+
+# =====================================
+# CSV REPORT
+# =====================================
+echo "domain,user_count,site,user_id,user_login,user_email,user_registered" > "$UNUSUAL_EMAILS_CSV"
+
+for domain in $(for d in "${!DOMAIN_COUNT[@]}"; do echo "${DOMAIN_COUNT[$d]} $d"; done | sort -rn | cut -d' ' -f2); do
+    COUNT=${DOMAIN_COUNT[$domain]}
+    
+    # Get all users for this domain
+    IFS='::' read -ra USERS <<< "${DOMAIN_USERS[$domain]}"
+    for user_info in "${USERS[@]}"; do
+        IFS='|' read -r SITE USER_ID USER_LOGIN USER_EMAIL USER_REGISTERED <<< "$user_info"
+        echo "$domain,$COUNT,\"$SITE\",$USER_ID,\"$USER_LOGIN\",\"$USER_EMAIL\",\"$USER_REGISTERED\"" >> "$UNUSUAL_EMAILS_CSV"
+    done
+done
+
+# =====================================
+# JSON REPORT
+# =====================================
+echo "{" > "$UNUSUAL_EMAILS_JSON"
+echo "  \"generated\": \"$(date -Iseconds)\"," >> "$UNUSUAL_EMAILS_JSON"
+echo "  \"summary\": {" >> "$UNUSUAL_EMAILS_JSON"
+echo "    \"total_sites_scanned\": $TOTAL_SITES," >> "$UNUSUAL_EMAILS_JSON"
+echo "    \"total_users\": $TOTAL_USERS," >> "$UNUSUAL_EMAILS_JSON"
+echo "    \"common_provider_users\": $TOTAL_COMMON_USERS," >> "$UNUSUAL_EMAILS_JSON"
+echo "    \"unusual_provider_users\": $TOTAL_UNUSUAL_USERS," >> "$UNUSUAL_EMAILS_JSON"
+echo "    \"unique_unusual_domains\": ${#DOMAIN_COUNT[@]}" >> "$UNUSUAL_EMAILS_JSON"
+echo "  }," >> "$UNUSUAL_EMAILS_JSON"
+echo "  \"unusual_domains\": [" >> "$UNUSUAL_EMAILS_JSON"
+
+FIRST_DOMAIN=true
+for domain in $(for d in "${!DOMAIN_COUNT[@]}"; do echo "${DOMAIN_COUNT[$d]} $d"; done | sort -rn | cut -d' ' -f2); do
+    if [ "$FIRST_DOMAIN" = true ]; then
+        FIRST_DOMAIN=false
+    else
+        echo "," >> "$UNUSUAL_EMAILS_JSON"
+    fi
+    
+    COUNT=${DOMAIN_COUNT[$domain]}
+    echo "    {" >> "$UNUSUAL_EMAILS_JSON"
+    echo "      \"domain\": \"$domain\"," >> "$UNUSUAL_EMAILS_JSON"
+    echo "      \"user_count\": $COUNT," >> "$UNUSUAL_EMAILS_JSON"
+    echo "      \"users\": [" >> "$UNUSUAL_EMAILS_JSON"
+    
+    # Get all users for this domain
+    IFS='::' read -ra USERS <<< "${DOMAIN_USERS[$domain]}"
+    FIRST_USER=true
+    for user_info in "${USERS[@]}"; do
+        if [ "$FIRST_USER" = true ]; then
+            FIRST_USER=false
+        else
+            echo "," >> "$UNUSUAL_EMAILS_JSON"
+        fi
+        
+        IFS='|' read -r SITE USER_ID USER_LOGIN USER_EMAIL USER_REGISTERED <<< "$user_info"
+        echo "        {" >> "$UNUSUAL_EMAILS_JSON"
+        echo "          \"site\": \"$SITE\"," >> "$UNUSUAL_EMAILS_JSON"
+        echo "          \"user_id\": $USER_ID," >> "$UNUSUAL_EMAILS_JSON"
+        echo "          \"user_login\": \"$USER_LOGIN\"," >> "$UNUSUAL_EMAILS_JSON"
+        echo "          \"user_email\": \"$USER_EMAIL\"," >> "$UNUSUAL_EMAILS_JSON"
+        echo "          \"user_registered\": \"$USER_REGISTERED\"" >> "$UNUSUAL_EMAILS_JSON"
+        echo -n "        }" >> "$UNUSUAL_EMAILS_JSON"
+    done
+    
+    echo "" >> "$UNUSUAL_EMAILS_JSON"
+    echo "      ]" >> "$UNUSUAL_EMAILS_JSON"
+    echo -n "    }" >> "$UNUSUAL_EMAILS_JSON"
+done
+
+echo "" >> "$UNUSUAL_EMAILS_JSON"
+echo "  ]" >> "$UNUSUAL_EMAILS_JSON"
+echo "}" >> "$UNUSUAL_EMAILS_JSON"
+
+# =====================================
+# DOMAIN STATISTICS
+# =====================================
+echo "Domain Statistics (Top Unusual Providers)" > "$DOMAIN_STATS_TXT"
+echo "=========================================" >> "$DOMAIN_STATS_TXT"
+echo "Generated: $(date)" >> "$DOMAIN_STATS_TXT"
+echo "" >> "$DOMAIN_STATS_TXT"
+printf "%-5s %-40s %s\n" "Rank" "Domain" "Users" >> "$DOMAIN_STATS_TXT"
+echo "-------------------------------------------------------------" >> "$DOMAIN_STATS_TXT"
+
+RANK=1
+for domain in $(for d in "${!DOMAIN_COUNT[@]}"; do echo "${DOMAIN_COUNT[$d]} $d"; done | sort -rn | cut -d' ' -f2); do
+    COUNT=${DOMAIN_COUNT[$domain]}
+    printf "%-5s %-40s %s\n" "$RANK" "$domain" "$COUNT" >> "$DOMAIN_STATS_TXT"
+    RANK=$((RANK + 1))
+done
+
+# =====================================
+# DISPLAY SUMMARY
+# =====================================
+echo -e "${GREEN}Summary:${NC}"
+echo -e "${CYAN}  Total sites scanned: $TOTAL_SITES${NC}"
+echo -e "${CYAN}  Total users found: $TOTAL_USERS${NC}"
+echo -e "${WHITE}  ├─ Common providers: $TOTAL_COMMON_USERS${NC}"
+echo -e "${YELLOW}  └─ Unusual providers: $TOTAL_UNUSUAL_USERS${NC}"
+echo -e "${YELLOW}  Unique unusual domains: ${#DOMAIN_COUNT[@]}${NC}"
+echo
+
+echo -e "${YELLOW}Top 10 Unusual Email Domains:${NC}"
+TOP_COUNT=0
+for domain in $(for d in "${!DOMAIN_COUNT[@]}"; do echo "${DOMAIN_COUNT[$d]} $d"; done | sort -rn | cut -d' ' -f2); do
+    if [ $TOP_COUNT -ge 10 ]; then
+        break
+    fi
+    COUNT=${DOMAIN_COUNT[$domain]}
+    echo -e "${CYAN}  $((TOP_COUNT + 1)). $domain ${GRAY}($COUNT user(s))${NC}"
+    TOP_COUNT=$((TOP_COUNT + 1))
+done
+
+if [ ${#DOMAIN_COUNT[@]} -gt 10 ]; then
+    echo -e "${GRAY}  ... and $((${#DOMAIN_COUNT[@]} - 10)) more (see reports for full list)${NC}"
+fi
+
+echo
+echo -e "${YELLOW}Reports saved to:${NC}"
+echo -e "${CYAN}  TXT Report: $UNUSUAL_EMAILS_TXT${NC}"
+echo -e "${CYAN}  CSV Report: $UNUSUAL_EMAILS_CSV${NC}"
+echo -e "${CYAN}  JSON Report: $UNUSUAL_EMAILS_JSON${NC}"
+echo -e "${CYAN}  Statistics: $DOMAIN_STATS_TXT${NC}"
+
+echo
+echo -e "${CYAN}=============================================${NC}"
+echo -e "${GREEN}Scan complete! Review the reports to identify potentially suspicious registrations.${NC}"
+echo -e "${CYAN}=============================================${NC}"
