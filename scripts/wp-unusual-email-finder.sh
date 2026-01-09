@@ -1,12 +1,12 @@
 #!/bin/bash
 # =====================================
-# WP Unusual Email Finder Script (Script 3)
-# Purpose: Find users with uncommon email providers
+# WP Unusual Email Finder (Script 2)
+# Purpose: Find and list unusual email domains for review
 # Features: 
-# - Uses GitHub whitelist as "common providers"
-# - Lists all unusual email domains
-# - Export to CSV, TXT, and JSON
-# - Statistics and analysis
+# - Compares against whitelist
+# - Groups results by domain
+# - Outputs in @domain format for easy blacklist addition
+# - No deletion - review only
 # =====================================
 
 # Color definitions
@@ -27,37 +27,34 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 # Create log directory if it doesn't exist
 mkdir -p "$LOG_DIR"
 
-# Output files
-UNUSUAL_EMAILS_TXT="$LOG_DIR/unusual_emails_$TIMESTAMP.txt"
-UNUSUAL_EMAILS_CSV="$LOG_DIR/unusual_emails_$TIMESTAMP.csv"
-UNUSUAL_EMAILS_JSON="$LOG_DIR/unusual_emails_$TIMESTAMP.json"
-DOMAIN_STATS_TXT="$LOG_DIR/domain_statistics_$TIMESTAMP.txt"
+# Log files
+UNUSUAL_DOMAINS_LOG="$LOG_DIR/unusual_domains_$TIMESTAMP.txt"
+UNUSUAL_DOMAINS_BLACKLIST="$LOG_DIR/unusual_domains_blacklist_ready_$TIMESTAMP.txt"
+UNUSUAL_DOMAINS_REPORT="$LOG_DIR/unusual_domains_report_$TIMESTAMP.txt"
 
-# Arrays for tracking
+# Associative arrays for tracking
 declare -A DOMAIN_COUNT
-declare -A DOMAIN_USERS
-declare -A COMMON_PROVIDERS
+declare -A DOMAIN_SAMPLE_USERS
 
 echo -e "${CYAN}=============================================${NC}"
-echo -e "${CYAN}==== WordPress Unusual Email Finder =======
-${NC}"
-echo -e "${CYAN}==== Find Uncommon Email Providers ========${NC}"
+echo -e "${CYAN}==== WordPress Unusual Email Finder ========${NC}"
+echo -e "${CYAN}==== Domain Analysis & Review ==============${NC}"
 echo -e "${CYAN}=============================================${NC}"
 echo
 
 # =====================================
-# FETCH COMMON PROVIDERS (WHITELIST) FROM GITHUB
+# FETCH WHITELIST FROM GITHUB (REQUIRED)
 # =====================================
-echo -e "${BLUE}Fetching list of common email providers from GitHub...${NC}"
+echo -e "${BLUE}Fetching whitelist from GitHub...${NC}"
 WHITELIST_URL="https://raw.githubusercontent.com/M-Saadawy/WordPress-spam-user-list/main/whitelist.txt"
 TEMP_WHITELIST=$(mktemp)
 
-COMMON_PROVIDER_LIST=()
+WHITELIST_DOMAINS=()
 
 if curl -s -f "$WHITELIST_URL" -o "$TEMP_WHITELIST" 2>/dev/null && [ -s "$TEMP_WHITELIST" ]; then
-    echo -e "${GREEN}✓ Successfully downloaded common providers list from GitHub${NC}"
+    echo -e "${GREEN}✓ Successfully downloaded whitelist from GitHub${NC}"
     
-    # Load common providers from file
+    # Load whitelist from file
     while IFS= read -r line; do
         # Trim whitespace
         line=$(echo "$line" | xargs)
@@ -65,59 +62,137 @@ if curl -s -f "$WHITELIST_URL" -o "$TEMP_WHITELIST" 2>/dev/null && [ -s "$TEMP_W
         if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
             # Remove @ if present
             line="${line#@}"
-            COMMON_PROVIDER_LIST+=("$line")
-            COMMON_PROVIDERS["$line"]=1
+            WHITELIST_DOMAINS+=("$line")
         fi
     done < "$TEMP_WHITELIST"
     
-    echo -e "${GREEN}  Loaded ${#COMMON_PROVIDER_LIST[@]} common email providers${NC}"
-    if [ ${#COMMON_PROVIDER_LIST[@]} -gt 3 ]; then
-        echo -e "${GRAY}  Sample: ${COMMON_PROVIDER_LIST[0]}, ${COMMON_PROVIDER_LIST[1]}, ${COMMON_PROVIDER_LIST[2]}...${NC}"
+    echo -e "${GREEN}  Loaded ${#WHITELIST_DOMAINS[@]} whitelisted domains${NC}"
+    if [ ${#WHITELIST_DOMAINS[@]} -gt 3 ]; then
+        echo -e "${GRAY}  Sample: ${WHITELIST_DOMAINS[0]}, ${WHITELIST_DOMAINS[1]}, ${WHITELIST_DOMAINS[2]}...${NC}"
     fi
 else
-    echo -e "${RED}✗ ERROR: Could not fetch common providers list from GitHub${NC}"
+    echo -e "${RED}✗ ERROR: Could not fetch whitelist from GitHub${NC}"
     echo -e "${RED}  URL: $WHITELIST_URL${NC}"
-    echo -e "${RED}  This list is required for operation. Exiting.${NC}"
+    echo -e "${RED}  The whitelist is required for safe operation. Exiting.${NC}"
     rm -f "$TEMP_WHITELIST"
     exit 1
 fi
 rm -f "$TEMP_WHITELIST"
 
-# Verify we have providers loaded
-if [ ${#COMMON_PROVIDER_LIST[@]} -eq 0 ]; then
-    echo -e "${RED}✗ ERROR: Common providers list is empty. Cannot proceed. Exiting.${NC}"
+# Verify we have domains loaded
+if [ ${#WHITELIST_DOMAINS[@]} -eq 0 ]; then
+    echo -e "${RED}✗ ERROR: Whitelist is empty. Cannot proceed safely. Exiting.${NC}"
     exit 1
 fi
 
-# Function to check if domain is a common provider
-is_common_provider() {
+# Convert whitelist to associative array for faster lookup
+declare -A WHITELIST_MAP
+for domain in "${WHITELIST_DOMAINS[@]}"; do
+    WHITELIST_MAP["$domain"]=1
+done
+
+# Function to check if domain is whitelisted
+is_whitelisted() {
     local domain="$1"
     # Remove @ if present
     domain="${domain#@}"
     
-    if [[ -n "${COMMON_PROVIDERS[$domain]}" ]]; then
-        return 0  # Is common provider
-    fi
-    return 1  # Not common provider (unusual)
+    # Check if exists in map (much faster than looping)
+    [[ -n "${WHITELIST_MAP[$domain]}" ]]
 }
 
 # =====================================
-# SCAN ALL WORDPRESS SITES
+# FETCH EXISTING BLACKLIST (OPTIONAL)
+# =====================================
+echo
+echo -e "${BLUE}Fetching existing blacklist from GitHub...${NC}"
+BLACKLIST_URL="https://raw.githubusercontent.com/M-Saadawy/WordPress-spam-user-list/main/list.txt"
+TEMP_BLACKLIST=$(mktemp)
+
+declare -A BLACKLIST_MAP
+
+if curl -s -f "$BLACKLIST_URL" -o "$TEMP_BLACKLIST" 2>/dev/null && [ -s "$TEMP_BLACKLIST" ]; then
+    echo -e "${GREEN}✓ Successfully downloaded blacklist from GitHub${NC}"
+    
+    # Load blacklist from file
+    BLACKLIST_COUNT=0
+    while IFS= read -r line; do
+        # Trim whitespace
+        line=$(echo "$line" | xargs)
+        # Skip empty lines and comments
+        if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
+            # Remove @ if present
+            line="${line#@}"
+            BLACKLIST_MAP["$line"]=1
+            ((BLACKLIST_COUNT++))
+        fi
+    done < "$TEMP_BLACKLIST"
+    
+    echo -e "${GREEN}  Loaded $BLACKLIST_COUNT blacklisted domains${NC}"
+    echo -e "${GRAY}  (These will be excluded from unusual domain results)${NC}"
+else
+    echo -e "${YELLOW}⚠ Could not fetch blacklist (this is optional)${NC}"
+    echo -e "${GRAY}  Continuing without blacklist filter...${NC}"
+fi
+rm -f "$TEMP_BLACKLIST"
+
+# Function to check if domain is blacklisted
+is_blacklisted() {
+    local domain="$1"
+    # Remove @ if present
+    domain="${domain#@}"
+    
+    # Check if exists in map
+    [[ -n "${BLACKLIST_MAP[$domain]}" ]]
+}
+
+# =====================================
+# CONFIGURATION
+# =====================================
+echo
+echo -e "${YELLOW}Configuration:${NC}"
+echo -e "${WHITE}  This script will scan all WordPress users and find unusual email domains.${NC}"
+echo -e "${WHITE}  Domains will be excluded if they are:${NC}"
+echo -e "${CYAN}    - Whitelisted (safe domains like gmail.com, yahoo.com, etc.)${NC}"
+echo -e "${CYAN}    - Already blacklisted (already known spam domains)${NC}"
+echo
+echo -e "${YELLOW}Minimum user count filter (optional):${NC}"
+echo -e "${GRAY}  Only show domains with at least X users (helps find patterns)${NC}"
+echo -e "${GRAY}  Enter 1 to see all domains, or higher number to filter (e.g., 5, 10)${NC}"
+echo -ne "${YELLOW}Enter minimum user count (default: 1): ${NC}"
+read MIN_USER_COUNT
+
+# Default to 1 if empty or non-numeric
+if ! [[ "$MIN_USER_COUNT" =~ ^[0-9]+$ ]]; then
+    MIN_USER_COUNT=1
+fi
+
+echo -e "${GREEN}  → Will show domains with at least $MIN_USER_COUNT user(s)${NC}"
+
+echo
+echo -ne "${YELLOW}Do you want to proceed? Type 'yes' to continue: ${NC}"
+read PROCEED
+if [ "$PROCEED" != "yes" ]; then
+    echo -e "${RED}Aborted by user.${NC}"
+    exit 1
+fi
+
+# =====================================
+# SCAN FOR UNUSUAL DOMAINS
 # =====================================
 echo
 echo -e "${BLUE}Scanning all WordPress sites under $BASE_DIR ...${NC}"
-echo -e "${GRAY}This may take a moment...${NC}"
+echo -e "${GRAY}This may take a while depending on the number of users...${NC}"
 echo
 
-TOTAL_USERS=0
-TOTAL_UNUSUAL_USERS=0
-TOTAL_COMMON_USERS=0
 TOTAL_SITES=0
+TOTAL_USERS_SCANNED=0
 
 for SITE_PATH in $BASE_DIR/*/public_html; do
     if [ -f "$SITE_PATH/wp-config.php" ]; then
-        SITE_NAME=$(basename $(dirname $(dirname "$SITE_PATH")))
-        echo -e "${MAGENTA}Scanning: ${CYAN}$SITE_NAME${NC}"
+        ((TOTAL_SITES++))
+        echo -e "${MAGENTA}-------------------------------------------${NC}"
+        echo -e "${WHITE}Site $TOTAL_SITES: ${CYAN}$SITE_PATH${NC}"
 
         # Extract database credentials from wp-config.php
         DB_NAME=$(grep "DB_NAME" "$SITE_PATH/wp-config.php" | cut -d"'" -f4)
@@ -131,61 +206,66 @@ for SITE_PATH in $BASE_DIR/*/public_html; do
         fi
 
         if [ -z "$DB_NAME" ] || [ -z "$DB_USER" ]; then
-            echo -e "${RED}  Error: Could not extract database credentials${NC}"
+            echo -e "${RED}  ✗ Could not extract database credentials${NC}"
             continue
         fi
 
-        # Get all users with their emails
-        USER_DATA=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "
-        SELECT ID, user_login, user_email, user_registered 
-        FROM ${PREFIX}users
-        ORDER BY user_registered DESC;
-        " 2>/dev/null)
+        echo -e "${GRAY}  Database: $DB_NAME, Prefix: $PREFIX${NC}"
 
-        if [ -z "$USER_DATA" ]; then
-            echo -e "${GRAY}  No users found${NC}"
+        # Get all user emails
+        USER_EMAILS=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "
+        SELECT user_login, user_email 
+        FROM ${PREFIX}users 
+        WHERE user_email != '' 
+        ORDER BY user_email;
+        " 2>&1)
+
+        if [[ "$USER_EMAILS" =~ ^ERROR ]]; then
+            echo -e "${RED}  ✗ Database error: $USER_EMAILS${NC}"
             continue
         fi
 
-        SITE_USERS=0
-        SITE_UNUSUAL=0
+        # Count users
+        SITE_USER_COUNT=$(echo "$USER_EMAILS" | wc -l)
+        if [ -z "$USER_EMAILS" ]; then
+            SITE_USER_COUNT=0
+        fi
         
-        while IFS=$'\t' read -r USER_ID USER_LOGIN USER_EMAIL USER_REGISTERED; do
-            TOTAL_USERS=$((TOTAL_USERS + 1))
-            SITE_USERS=$((SITE_USERS + 1))
-            
+        echo -e "${GREEN}  ✓ Found $SITE_USER_COUNT users${NC}"
+        TOTAL_USERS_SCANNED=$((TOTAL_USERS_SCANNED + SITE_USER_COUNT))
+
+        # Process each user email
+        while IFS=$'\t' read -r USER_LOGIN USER_EMAIL; do
             # Extract domain from email
-            DOMAIN=$(echo "$USER_EMAIL" | grep -oP '@\K.*')
-            
-            if [ -n "$DOMAIN" ]; then
-                # Check if it's a common provider
-                if ! is_common_provider "$DOMAIN"; then
-                    # Unusual email found
-                    TOTAL_UNUSUAL_USERS=$((TOTAL_UNUSUAL_USERS + 1))
-                    SITE_UNUSUAL=$((SITE_UNUSUAL + 1))
-                    
-                    # Track domain count
-                    if [[ -n "${DOMAIN_COUNT[$DOMAIN]}" ]]; then
-                        DOMAIN_COUNT[$DOMAIN]=$((${DOMAIN_COUNT[$DOMAIN]} + 1))
-                    else
-                        DOMAIN_COUNT[$DOMAIN]=1
-                    fi
-                    
-                    # Store user details for this domain
-                    USER_DETAILS="$SITE_NAME|$USER_ID|$USER_LOGIN|$USER_EMAIL|$USER_REGISTERED"
-                    if [[ -n "${DOMAIN_USERS[$DOMAIN]}" ]]; then
-                        DOMAIN_USERS[$DOMAIN]="${DOMAIN_USERS[$DOMAIN]}::$USER_DETAILS"
-                    else
-                        DOMAIN_USERS[$DOMAIN]="$USER_DETAILS"
-                    fi
+            if [[ "$USER_EMAIL" =~ @(.+)$ ]]; then
+                DOMAIN="${BASH_REMATCH[1]}"
+                
+                # Skip if whitelisted
+                if is_whitelisted "$DOMAIN"; then
+                    continue
+                fi
+                
+                # Skip if already blacklisted
+                if is_blacklisted "$DOMAIN"; then
+                    continue
+                fi
+                
+                # Track this domain
+                if [[ -z "${DOMAIN_COUNT[$DOMAIN]}" ]]; then
+                    DOMAIN_COUNT["$DOMAIN"]=1
+                    DOMAIN_SAMPLE_USERS["$DOMAIN"]="$USER_LOGIN ($USER_EMAIL)"
                 else
-                    TOTAL_COMMON_USERS=$((TOTAL_COMMON_USERS + 1))
+                    DOMAIN_COUNT["$DOMAIN"]=$((DOMAIN_COUNT["$DOMAIN"] + 1))
+                    # Keep first 3 sample users
+                    SAMPLE_COUNT=$(echo "${DOMAIN_SAMPLE_USERS[$DOMAIN]}" | grep -o "|" | wc -l)
+                    if [ "$SAMPLE_COUNT" -lt 2 ]; then
+                        DOMAIN_SAMPLE_USERS["$DOMAIN"]="${DOMAIN_SAMPLE_USERS[$DOMAIN]} | $USER_LOGIN ($USER_EMAIL)"
+                    fi
                 fi
             fi
-        done <<< "$USER_DATA"
+        done <<< "$USER_EMAILS"
         
-        echo -e "${GRAY}  Users: $SITE_USERS | Unusual: $SITE_UNUSUAL${NC}"
-        TOTAL_SITES=$((TOTAL_SITES + 1))
+        echo -e "${GRAY}  Processed. Unique unusual domains so far: ${#DOMAIN_COUNT[@]}${NC}"
     fi
 done
 
@@ -194,175 +274,126 @@ done
 # =====================================
 echo
 echo -e "${CYAN}=============================================${NC}"
-echo -e "${CYAN}==== Generating Reports ====================${NC}"
+echo -e "${CYAN}==== Analysis Complete =====================${NC}"
 echo -e "${CYAN}=============================================${NC}"
 echo
 
 if [ ${#DOMAIN_COUNT[@]} -eq 0 ]; then
-    echo -e "${GREEN}Great news! No unusual email domains found.${NC}"
-    echo -e "${GRAY}All users are using common email providers.${NC}"
+    echo -e "${GREEN}No unusual domains found!${NC}"
+    echo -e "${GRAY}All user emails are either whitelisted or already blacklisted.${NC}"
     exit 0
 fi
 
-# =====================================
-# TXT REPORT
-# =====================================
-echo "WordPress Unusual Email Domains Report" > "$UNUSUAL_EMAILS_TXT"
-echo "======================================" >> "$UNUSUAL_EMAILS_TXT"
-echo "Generated: $(date)" >> "$UNUSUAL_EMAILS_TXT"
-echo "Total Sites Scanned: $TOTAL_SITES" >> "$UNUSUAL_EMAILS_TXT"
-echo "Total Users: $TOTAL_USERS" >> "$UNUSUAL_EMAILS_TXT"
-echo "Common Provider Users: $TOTAL_COMMON_USERS" >> "$UNUSUAL_EMAILS_TXT"
-echo "Unusual Provider Users: $TOTAL_UNUSUAL_USERS" >> "$UNUSUAL_EMAILS_TXT"
-echo "Unique Unusual Domains: ${#DOMAIN_COUNT[@]}" >> "$UNUSUAL_EMAILS_TXT"
-echo "" >> "$UNUSUAL_EMAILS_TXT"
-echo "======================================" >> "$UNUSUAL_EMAILS_TXT"
-echo "" >> "$UNUSUAL_EMAILS_TXT"
-
-# Sort domains by count (most common first)
-for domain in $(for d in "${!DOMAIN_COUNT[@]}"; do echo "${DOMAIN_COUNT[$d]} $d"; done | sort -rn | cut -d' ' -f2); do
-    COUNT=${DOMAIN_COUNT[$domain]}
-    echo "Domain: $domain ($COUNT user(s))" >> "$UNUSUAL_EMAILS_TXT"
-    echo "----------------------------------------" >> "$UNUSUAL_EMAILS_TXT"
-    
-    # Get all users for this domain
-    IFS='::' read -ra USERS <<< "${DOMAIN_USERS[$domain]}"
-    for user_info in "${USERS[@]}"; do
-        IFS='|' read -r SITE USER_ID USER_LOGIN USER_EMAIL USER_REGISTERED <<< "$user_info"
-        echo "  Site: $SITE" >> "$UNUSUAL_EMAILS_TXT"
-        echo "  User ID: $USER_ID" >> "$UNUSUAL_EMAILS_TXT"
-        echo "  Login: $USER_LOGIN" >> "$UNUSUAL_EMAILS_TXT"
-        echo "  Email: $USER_EMAIL" >> "$UNUSUAL_EMAILS_TXT"
-        echo "  Registered: $USER_REGISTERED" >> "$UNUSUAL_EMAILS_TXT"
-        echo "" >> "$UNUSUAL_EMAILS_TXT"
-    done
-    echo "" >> "$UNUSUAL_EMAILS_TXT"
-done
-
-# =====================================
-# CSV REPORT
-# =====================================
-echo "domain,user_count,site,user_id,user_login,user_email,user_registered" > "$UNUSUAL_EMAILS_CSV"
-
-for domain in $(for d in "${!DOMAIN_COUNT[@]}"; do echo "${DOMAIN_COUNT[$d]} $d"; done | sort -rn | cut -d' ' -f2); do
-    COUNT=${DOMAIN_COUNT[$domain]}
-    
-    # Get all users for this domain
-    IFS='::' read -ra USERS <<< "${DOMAIN_USERS[$domain]}"
-    for user_info in "${USERS[@]}"; do
-        IFS='|' read -r SITE USER_ID USER_LOGIN USER_EMAIL USER_REGISTERED <<< "$user_info"
-        echo "$domain,$COUNT,\"$SITE\",$USER_ID,\"$USER_LOGIN\",\"$USER_EMAIL\",\"$USER_REGISTERED\"" >> "$UNUSUAL_EMAILS_CSV"
-    done
-done
-
-# =====================================
-# JSON REPORT
-# =====================================
-echo "{" > "$UNUSUAL_EMAILS_JSON"
-echo "  \"generated\": \"$(date -Iseconds)\"," >> "$UNUSUAL_EMAILS_JSON"
-echo "  \"summary\": {" >> "$UNUSUAL_EMAILS_JSON"
-echo "    \"total_sites_scanned\": $TOTAL_SITES," >> "$UNUSUAL_EMAILS_JSON"
-echo "    \"total_users\": $TOTAL_USERS," >> "$UNUSUAL_EMAILS_JSON"
-echo "    \"common_provider_users\": $TOTAL_COMMON_USERS," >> "$UNUSUAL_EMAILS_JSON"
-echo "    \"unusual_provider_users\": $TOTAL_UNUSUAL_USERS," >> "$UNUSUAL_EMAILS_JSON"
-echo "    \"unique_unusual_domains\": ${#DOMAIN_COUNT[@]}" >> "$UNUSUAL_EMAILS_JSON"
-echo "  }," >> "$UNUSUAL_EMAILS_JSON"
-echo "  \"unusual_domains\": [" >> "$UNUSUAL_EMAILS_JSON"
-
-FIRST_DOMAIN=true
-for domain in $(for d in "${!DOMAIN_COUNT[@]}"; do echo "${DOMAIN_COUNT[$d]} $d"; done | sort -rn | cut -d' ' -f2); do
-    if [ "$FIRST_DOMAIN" = true ]; then
-        FIRST_DOMAIN=false
-    else
-        echo "," >> "$UNUSUAL_EMAILS_JSON"
-    fi
-    
-    COUNT=${DOMAIN_COUNT[$domain]}
-    echo "    {" >> "$UNUSUAL_EMAILS_JSON"
-    echo "      \"domain\": \"$domain\"," >> "$UNUSUAL_EMAILS_JSON"
-    echo "      \"user_count\": $COUNT," >> "$UNUSUAL_EMAILS_JSON"
-    echo "      \"users\": [" >> "$UNUSUAL_EMAILS_JSON"
-    
-    # Get all users for this domain
-    IFS='::' read -ra USERS <<< "${DOMAIN_USERS[$domain]}"
-    FIRST_USER=true
-    for user_info in "${USERS[@]}"; do
-        if [ "$FIRST_USER" = true ]; then
-            FIRST_USER=false
-        else
-            echo "," >> "$UNUSUAL_EMAILS_JSON"
-        fi
-        
-        IFS='|' read -r SITE USER_ID USER_LOGIN USER_EMAIL USER_REGISTERED <<< "$user_info"
-        echo "        {" >> "$UNUSUAL_EMAILS_JSON"
-        echo "          \"site\": \"$SITE\"," >> "$UNUSUAL_EMAILS_JSON"
-        echo "          \"user_id\": $USER_ID," >> "$UNUSUAL_EMAILS_JSON"
-        echo "          \"user_login\": \"$USER_LOGIN\"," >> "$UNUSUAL_EMAILS_JSON"
-        echo "          \"user_email\": \"$USER_EMAIL\"," >> "$UNUSUAL_EMAILS_JSON"
-        echo "          \"user_registered\": \"$USER_REGISTERED\"" >> "$UNUSUAL_EMAILS_JSON"
-        echo -n "        }" >> "$UNUSUAL_EMAILS_JSON"
-    done
-    
-    echo "" >> "$UNUSUAL_EMAILS_JSON"
-    echo "      ]" >> "$UNUSUAL_EMAILS_JSON"
-    echo -n "    }" >> "$UNUSUAL_EMAILS_JSON"
-done
-
-echo "" >> "$UNUSUAL_EMAILS_JSON"
-echo "  ]" >> "$UNUSUAL_EMAILS_JSON"
-echo "}" >> "$UNUSUAL_EMAILS_JSON"
-
-# =====================================
-# DOMAIN STATISTICS
-# =====================================
-echo "Domain Statistics (Top Unusual Providers)" > "$DOMAIN_STATS_TXT"
-echo "=========================================" >> "$DOMAIN_STATS_TXT"
-echo "Generated: $(date)" >> "$DOMAIN_STATS_TXT"
-echo "" >> "$DOMAIN_STATS_TXT"
-printf "%-5s %-40s %s\n" "Rank" "Domain" "Users" >> "$DOMAIN_STATS_TXT"
-echo "-------------------------------------------------------------" >> "$DOMAIN_STATS_TXT"
-
-RANK=1
-for domain in $(for d in "${!DOMAIN_COUNT[@]}"; do echo "${DOMAIN_COUNT[$d]} $d"; done | sort -rn | cut -d' ' -f2); do
-    COUNT=${DOMAIN_COUNT[$domain]}
-    printf "%-5s %-40s %s\n" "$RANK" "$domain" "$COUNT" >> "$DOMAIN_STATS_TXT"
-    RANK=$((RANK + 1))
-done
-
-# =====================================
-# DISPLAY SUMMARY
-# =====================================
-echo -e "${GREEN}Summary:${NC}"
+echo -e "${GREEN}Scan Summary:${NC}"
 echo -e "${CYAN}  Total sites scanned: $TOTAL_SITES${NC}"
-echo -e "${CYAN}  Total users found: $TOTAL_USERS${NC}"
-echo -e "${WHITE}  ├─ Common providers: $TOTAL_COMMON_USERS${NC}"
-echo -e "${YELLOW}  └─ Unusual providers: $TOTAL_UNUSUAL_USERS${NC}"
-echo -e "${YELLOW}  Unique unusual domains: ${#DOMAIN_COUNT[@]}${NC}"
+echo -e "${CYAN}  Total users scanned: $TOTAL_USERS_SCANNED${NC}"
+echo -e "${CYAN}  Unusual domains found: ${#DOMAIN_COUNT[@]}${NC}"
 echo
 
-echo -e "${YELLOW}Top 10 Unusual Email Domains:${NC}"
-TOP_COUNT=0
-for domain in $(for d in "${!DOMAIN_COUNT[@]}"; do echo "${DOMAIN_COUNT[$d]} $d"; done | sort -rn | cut -d' ' -f2); do
-    if [ $TOP_COUNT -ge 10 ]; then
-        break
-    fi
-    COUNT=${DOMAIN_COUNT[$domain]}
-    echo -e "${CYAN}  $((TOP_COUNT + 1)). $domain ${GRAY}($COUNT user(s))${NC}"
-    TOP_COUNT=$((TOP_COUNT + 1))
-done
+# Sort domains by count (descending)
+SORTED_DOMAINS=$(for domain in "${!DOMAIN_COUNT[@]}"; do
+    echo "${DOMAIN_COUNT[$domain]} $domain"
+done | sort -rn)
 
-if [ ${#DOMAIN_COUNT[@]} -gt 10 ]; then
-    echo -e "${GRAY}  ... and $((${#DOMAIN_COUNT[@]} - 10)) more (see reports for full list)${NC}"
+# Filter by minimum count and generate reports
+echo -e "${YELLOW}Generating reports...${NC}"
+
+# Full report with details
+echo "========================================" > "$UNUSUAL_DOMAINS_REPORT"
+echo "Unusual Email Domains Report" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "Generated: $(date)" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "========================================" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "Total sites scanned: $TOTAL_SITES" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "Total users scanned: $TOTAL_USERS_SCANNED" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "Unusual domains found: ${#DOMAIN_COUNT[@]}" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "Minimum user count filter: $MIN_USER_COUNT" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "========================================" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "DOMAINS (sorted by user count)" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "========================================" >> "$UNUSUAL_DOMAINS_REPORT"
+echo "" >> "$UNUSUAL_DOMAINS_REPORT"
+
+# Simple domain list (for adding to blacklist)
+echo "# Unusual domains found on $(date)" > "$UNUSUAL_DOMAINS_BLACKLIST"
+echo "# Ready to add to blacklist" >> "$UNUSUAL_DOMAINS_BLACKLIST"
+echo "# Format: @domain (one per line)" >> "$UNUSUAL_DOMAINS_BLACKLIST"
+echo "" >> "$UNUSUAL_DOMAINS_BLACKLIST"
+
+# All domains list (unfiltered)
+echo "# All unusual domains (unfiltered)" > "$UNUSUAL_DOMAINS_LOG"
+echo "# Generated: $(date)" >> "$UNUSUAL_DOMAINS_LOG"
+echo "" >> "$UNUSUAL_DOMAINS_LOG"
+
+FILTERED_COUNT=0
+DISPLAYED_COUNT=0
+
+echo -e "${YELLOW}Top Unusual Domains (filtered by min count: $MIN_USER_COUNT):${NC}"
+echo
+
+while IFS=' ' read -r COUNT DOMAIN; do
+    # Add to unfiltered log
+    echo "@$DOMAIN" >> "$UNUSUAL_DOMAINS_LOG"
+    
+    # Add to detailed report
+    printf "Domain: @%-40s Users: %5d\n" "$DOMAIN" "$COUNT" >> "$UNUSUAL_DOMAINS_REPORT"
+    echo "  Sample users: ${DOMAIN_SAMPLE_USERS[$DOMAIN]}" >> "$UNUSUAL_DOMAINS_REPORT"
+    echo "" >> "$UNUSUAL_DOMAINS_REPORT"
+    
+    # Filter by minimum count
+    if [ "$COUNT" -ge "$MIN_USER_COUNT" ]; then
+        ((FILTERED_COUNT++))
+        
+        # Add to blacklist-ready file
+        echo "@$DOMAIN" >> "$UNUSUAL_DOMAINS_BLACKLIST"
+        
+        # Display top 50 on screen
+        if [ $DISPLAYED_COUNT -lt 50 ]; then
+            printf "${CYAN}  @%-40s ${YELLOW}%5d users${NC}\n" "$DOMAIN" "$COUNT"
+            ((DISPLAYED_COUNT++))
+        fi
+    fi
+done <<< "$SORTED_DOMAINS"
+
+if [ $DISPLAYED_COUNT -eq 50 ] && [ $FILTERED_COUNT -gt 50 ]; then
+    echo
+    echo -e "${GRAY}  ... and $((FILTERED_COUNT - 50)) more (see report files)${NC}"
 fi
 
+# =====================================
+# FINAL SUMMARY
+# =====================================
 echo
-echo -e "${YELLOW}Reports saved to:${NC}"
-echo -e "${CYAN}  TXT Report: $UNUSUAL_EMAILS_TXT${NC}"
-echo -e "${CYAN}  CSV Report: $UNUSUAL_EMAILS_CSV${NC}"
-echo -e "${CYAN}  JSON Report: $UNUSUAL_EMAILS_JSON${NC}"
-echo -e "${CYAN}  Statistics: $DOMAIN_STATS_TXT${NC}"
+echo -e "${CYAN}=============================================${NC}"
+echo -e "${CYAN}==== Reports Generated =====================${NC}"
+echo -e "${CYAN}=============================================${NC}"
+echo
 
+echo -e "${GREEN}Summary:${NC}"
+echo -e "${CYAN}  Total unusual domains found: ${#DOMAIN_COUNT[@]}${NC}"
+echo -e "${CYAN}  Domains meeting filter (≥$MIN_USER_COUNT users): $FILTERED_COUNT${NC}"
 echo
-echo -e "${CYAN}=============================================${NC}"
-echo -e "${GREEN}Scan complete! Review the reports to identify potentially suspicious registrations.${NC}"
-echo -e "${CYAN}=============================================${NC}"
+
+echo -e "${YELLOW}Report files saved:${NC}"
+echo -e "${WHITE}  1. Blacklist-ready file (filtered):${NC}"
+echo -e "${CYAN}     $UNUSUAL_DOMAINS_BLACKLIST${NC}"
+echo -e "${GRAY}     → Use this to add domains to your blacklist${NC}"
+echo
+
+echo -e "${WHITE}  2. Detailed report:${NC}"
+echo -e "${CYAN}     $UNUSUAL_DOMAINS_REPORT${NC}"
+echo -e "${GRAY}     → Full analysis with user counts and samples${NC}"
+echo
+
+echo -e "${WHITE}  3. All domains (unfiltered):${NC}"
+echo -e "${CYAN}     $UNUSUAL_DOMAINS_LOG${NC}"
+echo -e "${GRAY}     → Complete list regardless of user count${NC}"
+echo
+
+echo -e "${YELLOW}Next steps:${NC}"
+echo -e "${WHITE}  1. Review the blacklist-ready file: ${CYAN}$UNUSUAL_DOMAINS_BLACKLIST${NC}"
+echo -e "${WHITE}  2. Copy legitimate domains to whitelist, spam domains to blacklist${NC}"
+echo -e "${WHITE}  3. Run the cleanup script (Script 1) to delete spam users${NC}"
+echo
+
+echo -e "${CYAN}Thank you for using WordPress Unusual Email Finder!${NC}"
