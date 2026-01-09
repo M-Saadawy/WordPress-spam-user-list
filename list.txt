@@ -1081,7 +1081,6 @@
 @apple.com
 @aol.com.au
 @allianz.de
-@GMAIL.COM
 @01019freenet.de
 @zoom.co.uk
 @zonline.se
