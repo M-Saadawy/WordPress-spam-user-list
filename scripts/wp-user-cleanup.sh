@@ -6,6 +6,7 @@
 # - Exact domain matching (prevents false positives)
 # - Dynamic whitelist from GitHub (required)
 # - Comprehensive logging
+# - Batch processing for large domain lists
 # =====================================
 
 # Color definitions
@@ -31,6 +32,7 @@ USERS_LOG="$LOG_DIR/deleted_users_$TIMESTAMP.txt"
 DOMAINS_LOG="$LOG_DIR/spam_domains.txt"
 DOMAINS_CSV="$LOG_DIR/spam_domains.csv"
 DOMAINS_JSON="$LOG_DIR/spam_domains.json"
+DEBUG_LOG="$LOG_DIR/debug_$TIMESTAMP.txt"
 
 # Initialize domain tracking
 declare -A DOMAIN_MAP
@@ -265,35 +267,74 @@ for SITE_PATH in $BASE_DIR/*/public_html; do
         echo -e "${GRAY}  Database: $DB_NAME, Prefix: $PREFIX${NC}"
         echo -e "${GRAY}  Searching for ${#SPAM_DOMAINS[@]} spam domain(s)...${NC}"
 
-        # Build WHERE clause with exact domain matching using SUBSTRING_INDEX
-        WHERE_CLAUSE=""
+        # First, let's test the database connection
+        echo -e "${BLUE}  Testing database connection...${NC}"
+        TOTAL_USERS=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "SELECT COUNT(*) FROM ${PREFIX}users;" 2>&1)
         
-        for domain in "${SPAM_DOMAINS[@]}"; do
-            domain_escaped=$(escape_for_sql "$domain")
-            # Remove @ from domain for matching
-            domain_no_at="${domain_escaped#@}"
+        if [[ "$TOTAL_USERS" =~ ^[0-9]+$ ]]; then
+            echo -e "${GREEN}  ✓ Database connected. Total users in database: $TOTAL_USERS${NC}"
+        else
+            echo -e "${RED}  ✗ Database connection error: $TOTAL_USERS${NC}"
+            continue
+        fi
+
+        # Debug: Log the query
+        echo "=== DEBUG for $SITE_PATH ===" >> "$DEBUG_LOG"
+        echo "Timestamp: $(date)" >> "$DEBUG_LOG"
+        echo "Total spam domains to check: ${#SPAM_DOMAINS[@]}" >> "$DEBUG_LOG"
+        
+        # Process domains in batches to avoid "Argument list too long" error
+        # We'll use IN clause which is more efficient than many ORs
+        BATCH_SIZE=500
+        ALL_USER_DATA=""
+        TOTAL_BATCHES=$(( (${#SPAM_DOMAINS[@]} + BATCH_SIZE - 1) / BATCH_SIZE ))
+        
+        echo -e "${BLUE}  Processing in $TOTAL_BATCHES batch(es) of up to $BATCH_SIZE domains each...${NC}"
+        
+        for ((batch_start=0; batch_start<${#SPAM_DOMAINS[@]}; batch_start+=BATCH_SIZE)); do
+            batch_end=$((batch_start + BATCH_SIZE))
+            if [ $batch_end -gt ${#SPAM_DOMAINS[@]} ]; then
+                batch_end=${#SPAM_DOMAINS[@]}
+            fi
             
-            if [ -z "$WHERE_CLAUSE" ]; then
-                # EXACT match: SUBSTRING_INDEX(user_email, '@', -1) gets everything after @
-                WHERE_CLAUSE="SUBSTRING_INDEX(user_email, '@', -1) = '$domain_no_at'"
-            else
-                WHERE_CLAUSE="$WHERE_CLAUSE OR SUBSTRING_INDEX(user_email, '@', -1) = '$domain_no_at'"
+            batch_num=$(( batch_start / BATCH_SIZE + 1 ))
+            echo -e "${GRAY}    Batch $batch_num/$TOTAL_BATCHES (domains $batch_start-$((batch_end-1)))...${NC}"
+            
+            # Build IN clause for this batch
+            DOMAIN_LIST=""
+            for ((i=batch_start; i<batch_end; i++)); do
+                domain="${SPAM_DOMAINS[$i]}"
+                domain_escaped=$(escape_for_sql "$domain")
+                domain_no_at="${domain_escaped#@}"
+                
+                if [ -z "$DOMAIN_LIST" ]; then
+                    DOMAIN_LIST="'$domain_no_at'"
+                else
+                    DOMAIN_LIST="$DOMAIN_LIST,'$domain_no_at'"
+                fi
+            done
+            
+            # Query for this batch
+            BATCH_QUERY="SELECT ID, user_login, user_email FROM ${PREFIX}users WHERE SUBSTRING_INDEX(user_email, '@', -1) IN ($DOMAIN_LIST);"
+            
+            echo "Batch $batch_num query length: ${#BATCH_QUERY} chars" >> "$DEBUG_LOG"
+            
+            BATCH_USER_DATA=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "$BATCH_QUERY" 2>&1)
+            
+            if [ -n "$BATCH_USER_DATA" ]; then
+                if [ -z "$ALL_USER_DATA" ]; then
+                    ALL_USER_DATA="$BATCH_USER_DATA"
+                else
+                    ALL_USER_DATA="$ALL_USER_DATA"$'\n'"$BATCH_USER_DATA"
+                fi
             fi
         done
         
-        # Also search in username/login for spam keywords (optional but helpful)
-        SPAM_USER_KEYWORDS=("BINANCE" "BYBIT" "BTC" "BITCOIN" "CRYPTO" "MINING" "WALLET" "ETHEREUM" "USDT" "FOREX" "TRADING")
-        for keyword in "${SPAM_USER_KEYWORDS[@]}"; do
-            keyword_escaped=$(escape_for_sql "$keyword")
-            WHERE_CLAUSE="$WHERE_CLAUSE OR user_login LIKE '%$keyword_escaped%'"
-        done
-
-        # Get matching users details BEFORE deletion
-        USER_DATA=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "
-        SELECT ID, user_login, user_email 
-        FROM ${PREFIX}users
-        WHERE $WHERE_CLAUSE;
-        " 2>/dev/null)
+        USER_DATA="$ALL_USER_DATA"
+        
+        # Log query result
+        echo "Total matching users found: $(echo "$USER_DATA" | wc -l)" >> "$DEBUG_LOG"
+        echo "" >> "$DEBUG_LOG"
 
         # Count matching users
         if [ -z "$USER_DATA" ]; then
@@ -311,10 +352,13 @@ for SITE_PATH in $BASE_DIR/*/public_html; do
             echo "Database: $DB_NAME" >> "$USERS_LOG"
             echo "" >> "$USERS_LOG"
             
-            echo "$USER_DATA" | while IFS=$'\t' read -r USER_ID USER_LOGIN USER_EMAIL; do
+            # Process user data without subshell to preserve DOMAIN_MAP
+            while IFS=$'\t' read -r USER_ID USER_LOGIN USER_EMAIL; do
                 # Extract and store domain for logging
                 DOMAIN=$(echo "$USER_EMAIL" | grep -oP '@\K.*')
-                DOMAIN_MAP["$DOMAIN"]=1
+                if [ -n "$DOMAIN" ]; then
+                    DOMAIN_MAP["$DOMAIN"]=1
+                fi
                 
                 echo -e "${YELLOW}  - ID: $USER_ID, Login: $USER_LOGIN, Email: $USER_EMAIL${NC}"
                 
@@ -323,7 +367,7 @@ for SITE_PATH in $BASE_DIR/*/public_html; do
                 echo "  Login: $USER_LOGIN" >> "$USERS_LOG"
                 echo "  Email: $USER_EMAIL" >> "$USERS_LOG"
                 echo "" >> "$USERS_LOG"
-            done
+            done <<< "$USER_DATA"
             
             echo
             echo -ne "${RED}Do you want to DELETE these users? Type 'yes' to confirm: ${NC}"
@@ -334,9 +378,7 @@ for SITE_PATH in $BASE_DIR/*/public_html; do
                 USER_IDS=$(echo "$USER_DATA" | cut -f1 | tr '\n' ',' | sed 's/,$//')
                 
                 # Count comments by these users
-                COMMENT_COUNT_BY_USERS=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "
-                SELECT COUNT(*) FROM ${PREFIX}comments WHERE user_id IN ($USER_IDS);
-                " 2>/dev/null)
+                COMMENT_COUNT_BY_USERS=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e "SELECT COUNT(*) FROM ${PREFIX}comments WHERE user_id IN ($USER_IDS);" 2>/dev/null)
                 
                 # Default to 0 if query returns empty/null
                 COMMENT_COUNT_BY_USERS=${COMMENT_COUNT_BY_USERS:-0}
@@ -345,34 +387,41 @@ for SITE_PATH in $BASE_DIR/*/public_html; do
                     echo -e "${YELLOW}  → These users have $COMMENT_COUNT_BY_USERS comment(s) that will also be deleted${NC}"
                 fi
                 
-                # Perform deletion - delete comments first, then commentmeta, then usermeta, then users
+                # Perform deletion in batches to avoid argument list issues
+                echo -e "${BLUE}  Deleting users in batches...${NC}"
                 
-                # Delete commentmeta for comments by these users
-                mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-                DELETE FROM ${PREFIX}commentmeta
-                WHERE comment_id IN (
-                    SELECT comment_ID FROM (SELECT comment_ID FROM ${PREFIX}comments WHERE user_id IN ($USER_IDS)) AS temp
-                );
-                " 2>/dev/null
+                # Split USER_IDS into batches of 1000 IDs
+                ID_ARRAY=(${USER_IDS//,/ })
+                ID_BATCH_SIZE=1000
                 
-                # Delete comments by these users
-                mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-                DELETE FROM ${PREFIX}comments WHERE user_id IN ($USER_IDS);
-                " 2>/dev/null
-                
-                # Delete usermeta
-                mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-                DELETE FROM ${PREFIX}usermeta
-                WHERE user_id IN (
-                    SELECT ID FROM (SELECT ID FROM ${PREFIX}users WHERE $WHERE_CLAUSE) AS temp
-                );
-                " 2>/dev/null
+                for ((id_start=0; id_start<${#ID_ARRAY[@]}; id_start+=ID_BATCH_SIZE)); do
+                    id_end=$((id_start + ID_BATCH_SIZE))
+                    if [ $id_end -gt ${#ID_ARRAY[@]} ]; then
+                        id_end=${#ID_ARRAY[@]}
+                    fi
+                    
+                    # Get batch of IDs
+                    BATCH_IDS=$(IFS=,; echo "${ID_ARRAY[*]:$id_start:$ID_BATCH_SIZE}")
+                    
+                    echo -e "${GRAY}    Deleting batch: IDs $id_start to $((id_end-1))...${NC}"
+                    
+                    # Delete commentmeta for comments by these users
+                    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
+                    DELETE FROM ${PREFIX}commentmeta
+                    WHERE comment_id IN (
+                        SELECT comment_ID FROM (SELECT comment_ID FROM ${PREFIX}comments WHERE user_id IN ($BATCH_IDS)) AS temp
+                    );
+                    " 2>/dev/null
+                    
+                    # Delete comments by these users
+                    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "DELETE FROM ${PREFIX}comments WHERE user_id IN ($BATCH_IDS);" 2>/dev/null
+                    
+                    # Delete usermeta
+                    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "DELETE FROM ${PREFIX}usermeta WHERE user_id IN ($BATCH_IDS);" 2>/dev/null
 
-                # Delete users
-                mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-                DELETE FROM ${PREFIX}users
-                WHERE $WHERE_CLAUSE;
-                " 2>/dev/null
+                    # Delete users
+                    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "DELETE FROM ${PREFIX}users WHERE ID IN ($BATCH_IDS);" 2>/dev/null
+                done
                 
                 echo -e "${GREEN}✓ Deleted $USER_COUNT user(s)${NC}"
                 if [ "$COMMENT_COUNT_BY_USERS" -gt 0 ]; then
@@ -384,7 +433,8 @@ for SITE_PATH in $BASE_DIR/*/public_html; do
                 echo -e "${GRAY}Skipped user deletion${NC}"
             fi
         else
-            echo -e "${GRAY}No spam users found${NC}"
+            echo -e "${YELLOW}No spam users found with exact domain match${NC}"
+            echo -e "${GRAY}Check $DEBUG_LOG for query details${NC}"
         fi
         echo
     fi
@@ -466,9 +516,11 @@ if [ "$TOTAL_DELETED_USERS" -gt 0 ]; then
     echo -e "${CYAN}  Domains (TXT): $DOMAINS_LOG${NC}"
     echo -e "${CYAN}  Domains (CSV): $DOMAINS_CSV${NC}"
     echo -e "${CYAN}  Domains (JSON): $DOMAINS_JSON${NC}"
+    echo -e "${CYAN}  Debug Log: $DEBUG_LOG${NC}"
 else
     echo -e "${YELLOW}Summary:${NC}"
     echo -e "${YELLOW}  No users were deleted${NC}"
+    echo -e "${CYAN}  Debug log available at: $DEBUG_LOG${NC}"
 fi
 
 echo
