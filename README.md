@@ -12,3 +12,5 @@ Then the cleanup script will look for keywords and domains and delete them from 
 You should be careful after you run the `wp-unusual-email-finder.sh` as it may include your domains. I'm working on a mechanism, but who know!
 
 I recommend you backup your database/server before doing anything.
+
+The scripts are for those who wanna play it safe, as it's delibrately not checking for patterns but for exact matches, which make it long, but also safe, so it's delibrate by design.
